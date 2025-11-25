@@ -1,8 +1,8 @@
 unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 10; // 10ms = 100 Hz
+const unsigned long sendInterval = 3.8; // 10ms = 100 Hz
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(921600);
   pinMode(34, INPUT);
 }
 

@@ -9,14 +9,15 @@ import time
 import glob
 
 class SignalProcessor:
-    def __init__(self, port=None, baudrate=115200, buffer_size=100):
+    def __init__(self, port=None, baudrate=921600, buffer_size=1000):  # Aumentado baudrate y buffer
         if port is None:
             port = self.find_serial_port()
         
         try:
-            self.ser = serial.Serial(port, baudrate, timeout=0.01)
+            self.ser = serial.Serial(port, baudrate, timeout=0.001)  # Timeout más corto
             print(f"✓ Conectado al puerto {port}")
             print(f"✓ Configuración: {baudrate} bauds")
+            print(f"✓ Frecuencia objetivo: 300 Hz")
             
             self.ser.reset_input_buffer()
             time.sleep(1)
@@ -33,6 +34,11 @@ class SignalProcessor:
         self.time_buffer = deque(maxlen=buffer_size)
         self.start_time = time.time()
         self.last_update_time = time.time()
+        
+        # Variables para estadísticas de muestreo
+        self.sample_count = 0
+        self.last_sample_time = time.time()
+        self.actual_sample_rate = 0
         
         # Variables para detección de pulsos
         self.peaks = []  # Lista de tiempos de picos detectados
@@ -85,18 +91,56 @@ class SignalProcessor:
                     test_data.append(value)
                     print(f"Dato recibido: {value}")
                     
-                    if len(test_data) >= 5:
+                    if len(test_data) >= 10:  # Más datos para prueba
                         break
                         
                 except Exception as e:
                     continue
         
         if test_data:
+            actual_rate = len(test_data) / min(timeout, time.time() - start_time)
             print(f"✓ Conexión OK - Se recibieron {len(test_data)} datos")
+            print(f"✓ Tasa de muestreo estimada: {actual_rate:.1f} Hz")
             return True
         else:
             print("✗ No se recibieron datos")
             return False
+    
+    def update_sample_rate(self):
+        """Calcula la tasa de muestreo real"""
+        current_time = time.time()
+        elapsed = current_time - self.last_sample_time
+        
+        if elapsed >= 1.0:  # Actualizar cada segundo
+            self.actual_sample_rate = self.sample_count / elapsed
+            self.sample_count = 0
+            self.last_sample_time = current_time
+    
+    def read_data_batch(self):
+        """Lee múltiples datos en lote para mayor eficiencia"""
+        try:
+            data_points = []
+            bytes_available = self.ser.in_waiting
+            
+            if bytes_available > 0:
+                # Leer todos los datos disponibles
+                raw_data = self.ser.read(bytes_available)
+                lines = raw_data.decode('utf-8').split('\n')
+                
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        try:
+                            value = float(line)
+                            data_points.append(value)
+                            self.sample_count += 1
+                        except ValueError:
+                            continue
+            
+            return data_points
+            
+        except Exception as e:
+            return []
     
     def detect_peaks(self, data_window, time_window):
         """Detección robusta de picos para ECG"""
@@ -113,24 +157,26 @@ class SignalProcessor:
         
         # Umbral adaptativo (ajustar según tu señal)
         dynamic_threshold = self.signal_mean + 2 * self.signal_std
-        self.threshold = max(30, dynamic_threshold)  # Mínimo 2000
+        self.threshold = max(30, dynamic_threshold)
         
         detected_peaks = []
         current_time = time_window[-1]
         
         # Buscar picos en los últimos datos (ventana deslizante)
-        window_size = min(20, len(data_window))
+        window_size = min(30, len(data_window))  # Ventana más grande para 300Hz
         recent_data = list(data_window)[-window_size:]
         recent_times = list(time_window)[-window_size:]
         
-        for i in range(2, len(recent_data)-2):
+        for i in range(3, len(recent_data)-3):  # Ventana más amplia
             # Condición de pico: punto más alto en una ventana pequeña
             if (recent_data[i] > recent_data[i-1] and 
                 recent_data[i] > recent_data[i-2] and
+                recent_data[i] > recent_data[i-3] and
                 recent_data[i] > recent_data[i+1] and 
                 recent_data[i] > recent_data[i+2] and
+                recent_data[i] > recent_data[i+3] and
                 recent_data[i] > self.threshold and
-                recent_data[i] - min(recent_data[max(0,i-5):i+5]) > self.peak_height):
+                recent_data[i] - min(recent_data[max(0,i-8):i+8]) > self.peak_height):
                 
                 peak_time = recent_times[i]
                 
@@ -146,8 +192,8 @@ class SignalProcessor:
         if len(self.peaks) < 2:
             return 0
         
-        # Usar los últimos 8 picos para cálculo más estable
-        recent_peaks = self.peaks[-8:]
+        # Usar los últimos 10 picos para cálculo más estable (más datos con 300Hz)
+        recent_peaks = self.peaks[-10:]
         
         if len(recent_peaks) < 2:
             return 0
@@ -172,24 +218,9 @@ class SignalProcessor:
         
         return heart_rate
     
-    def read_data(self):
-        """Lee múltiples datos del buffer para reducir latencia"""
-        try:
-            data_points = []
-            while self.ser.in_waiting > 0:
-                raw_line = self.ser.readline()
-                line = raw_line.decode('utf-8').strip()
-                value = float(line)
-                data_points.append(value)
-            
-            return data_points[-1] if data_points else None
-            
-        except Exception:
-            return None
-    
     def process_realtime(self):
         print("\n" + "="*50)
-        print("INICIANDO VISUALIZACIÓN EN TIEMPO REAL")
+        print("INICIANDO VISUALIZACIÓN EN TIEMPO REAL - 300 Hz")
         print("="*50)
         print("Presiona Ctrl+C en la ventana de gráfico para detener")
         
@@ -197,19 +228,26 @@ class SignalProcessor:
         
         self.data_count = 0
         self.last_print_time = time.time()
+        self.last_rate_update = time.time()
         
         def animate(frame):
-            new_value = self.read_data()
+            # Leer datos en lote
+            data_batch = self.read_data_batch()
             
-            if new_value is not None:
-                self.data_count += 1
+            if data_batch:
                 current_time = time.time() - self.start_time
                 
-                self.data_buffer.append(new_value)
-                self.time_buffer.append(current_time)
+                # Agregar todos los datos del lote al buffer
+                for value in data_batch:
+                    self.data_buffer.append(value)
+                    self.time_buffer.append(current_time)
+                    self.data_count += 1
+                
+                # Actualizar tasa de muestreo
+                self.update_sample_rate()
                 
                 # Detectar picos
-                if len(self.data_buffer) > 20:
+                if len(self.data_buffer) > 30:  # Mayor ventana para 300Hz
                     new_peaks = self.detect_peaks(self.data_buffer, self.time_buffer)
                     
                     for peak_time, peak_value in new_peaks:
@@ -218,11 +256,12 @@ class SignalProcessor:
                             self.total_beats += 1
                             print(f"¡Pulso detectado! Total: {self.total_beats}")
                 
-                # Calcular frecuencia cardíaca cada 2 segundos
-                if len(self.peaks) >= 2 and time.time() - self.last_print_time >= 2:
+                # Calcular frecuencia cardíaca y mostrar info cada 2 segundos
+                current_real_time = time.time()
+                if len(self.peaks) >= 2 and current_real_time - self.last_print_time >= 2:
                     self.heart_rate = self.calculate_heart_rate()
-                    print(f"Pulsos: {self.total_beats} - Frecuencia: {self.heart_rate:.1f} BPM")
-                    self.last_print_time = time.time()
+                    print(f"Pulsos: {self.total_beats} - Frecuencia: {self.heart_rate:.1f} BPM - Muestreo: {self.actual_sample_rate:.1f} Hz")
+                    self.last_print_time = current_real_time
                 
                 if len(self.data_buffer) > 2:
                     data_array = np.array(self.data_buffer)
@@ -231,39 +270,39 @@ class SignalProcessor:
                     ax.clear()
                     
                     # Graficar señal principal
-                    ax.plot(time_array, data_array, 'b-', linewidth=1.5, label='Señal ECG', alpha=0.7)
+                    ax.plot(time_array, data_array, 'b-', linewidth=1.0, label='Señal ECG', alpha=0.8)
                     
                     # Graficar picos detectados
                     if self.peaks:
-                        peak_times = [p[0] for p in self.peaks if p[0] in time_array]
-                        peak_values = [p[1] for p in self.peaks if p[0] in time_array]
+                        peak_times = [p[0] for p in self.peaks if p[0] >= time_array[0] and p[0] <= time_array[-1]]
+                        peak_values = [p[1] for p in self.peaks if p[0] >= time_array[0] and p[0] <= time_array[-1]]
                         ax.plot(peak_times, peak_values, 'ro', markersize=6, label='Pulsos detectados')
                     
                     # Línea de umbral
                     ax.axhline(y=self.threshold, color='r', linestyle='--', alpha=0.5, label='Umbral')
                     
                     # Configuración del gráfico
-                    ax.set_title(f'Electrocardiograma en Tiempo Real', fontsize=14, fontweight='bold')
+                    ax.set_title(f'Electrocardiograma en Tiempo Real - {self.actual_sample_rate:.1f} Hz', fontsize=14, fontweight='bold')
                     ax.set_ylabel('Valor ADC', fontsize=12)
                     ax.set_xlabel('Tiempo (s)', fontsize=12)
                     ax.legend(loc='upper right')
                     ax.grid(True, alpha=0.3)
                     
                     # Mostrar información de pulsos en el gráfico
-                    info_text = f'Pulsos totales: {self.total_beats}\nFrecuencia cardíaca: {self.heart_rate:.1f} BPM\nUmbral: {self.threshold:.0f}'
-                    ax.text(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=12,
+                    info_text = f'Pulsos totales: {self.total_beats}\nFrecuencia cardíaca: {self.heart_rate:.1f} BPM\nUmbral: {self.threshold:.0f}\nTasa de muestreo: {self.actual_sample_rate:.1f} Hz'
+                    ax.text(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=11,
                            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
                     
                     # Ajustar ejes automáticamente
                     ax.relim()
                     ax.autoscale_view()
             
-            elif frame % 50 == 0:
+            elif frame % 100 == 0:
                 print("Esperando datos...")
         
         try:
             ani = animation.FuncAnimation(
-                fig, animate, interval=20, cache_frame_data=False, blit=False
+                fig, animate, interval=10, cache_frame_data=False, blit=False  # Intervalo más corto
             )
             
             plt.tight_layout()
@@ -275,6 +314,7 @@ class SignalProcessor:
             print(f"\nResumen final:")
             print(f"Total de datos procesados: {self.data_count}")
             print(f"Total de pulsos detectados: {self.total_beats}")
+            print(f"Tasa de muestreo promedio: {self.actual_sample_rate:.1f} Hz")
             if self.heart_rate > 0:
                 print(f"Frecuencia cardíaca final: {self.heart_rate:.1f} BPM")
 
@@ -283,8 +323,9 @@ if __name__ == "__main__":
     try:
         print("Iniciando sistema de monitorización de ECG...")
         print("Algoritmo de detección de pulsos activado")
+        print("Frecuencia objetivo: 300 Hz")
         
-        processor = SignalProcessor(baudrate=115200)
+        processor = SignalProcessor(baudrate=921600)  # Baudrate aumentado
         processor.process_realtime()
         
     except KeyboardInterrupt:
